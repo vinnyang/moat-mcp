@@ -46,12 +46,38 @@ npx @modelcontextprotocol/inspector node dist/index.js
 |---|---|
 | Input validation | Zod schema — `sql: string`, optional positional `params` |
 | SQL-AST gate | `node-sql-parser` parses + classifies every statement; writes are rejected **before** any DB call |
+| Table allow-list | `ALLOWED_TABLES` env — queries referencing any other table are blocked up front |
+| Column allow-list | `ALLOWED_COLUMNS` env — queries referencing disallowed columns (or `SELECT *`) are blocked up front |
 | Read-only hint | `annotations: { readOnlyHint: true }` advertised in `tools/list` |
 | Enforcement | `BEGIN TRANSACTION READ ONLY` — Postgres rejects any write statement (backstop) |
 | Result | JSON: `{ rowCount, rows }` |
 | Errors | Structured `{ content, isError: true }` so LLMs can read and self-correct |
 
-There are two independent guards. The SQL-AST gate is the fast, first line: it parses the SQL and refuses `INSERT`/`UPDATE`/`DELETE`/`CREATE`/`DROP`/`ALTER`/`TRUNCATE` with a `Blocked:` error, consuming no DB connection. The read-only transaction is the second-line backstop — even if a write slips past parsing (or the gate is bypassed), Postgres itself refuses with `cannot execute DELETE in a read-only transaction`. Unknown/parse-failing statements are **denied by default**. Multi-statement SQL requires every statement to be read-only.
+There are three independent guards. The SQL-AST gate is the fast, first line: it parses the SQL and refuses `INSERT`/`UPDATE`/`DELETE`/`CREATE`/`DROP`/`ALTER`/`TRUNCATE` with a `Blocked:` error, consuming no DB connection. The optional table/column allow-lists enforce *which data* the agent may touch — also before any DB call, and also structured as `Blocked:` errors. The read-only transaction is the final backstop — even if a write or disallowed reference slips past the app layer, Postgres itself refuses. Unknown/parse-failing statements are **denied by default**. Multi-statement SQL requires every statement to pass every gate.
+
+### Allow-lists
+
+By default nothing is restricted beyond read-only. Set these env vars to scope what the agent can see:
+
+```bash
+ALLOWED_TABLES="film,category"                          # only these tables
+ALLOWED_COLUMNS="film.title,film.length,category.name"  # only these table.column pairs
+```
+
+- `ALLOWED_TABLES` is a comma-separated set of table names. Any query whose AST references a table outside the set is blocked.
+- `ALLOWED_COLUMNS` is a comma-separated set of `table.column` pairs. Any column reference outside the set is blocked; `SELECT *` is rejected outright (it would expose every column).
+- Table aliases (`FROM film f` → `f.title`) are resolved to their real table. CTE names are treated as in-query virtual tables: their *body* is checked, but the CTE reference itself is let through.
+- An allow-list *adds* a deny constraint — it never broadens what the read-only gate already allows.
+
+```json
+// tools/call → {"name":"query","arguments":{"sql":"SELECT * FROM actor"}}
+{ "content": [{ "type": "text", "text": "Blocked: table(s) not allowed: actor" }], "isError": true }
+```
+
+```json
+// tools/call → {"name":"query","arguments":{"sql":"SELECT rating FROM film"}}
+{ "content": [{ "type": "text", "text": "Blocked: column 'film.rating' is not allowed" }], "isError": true }
+```
 
 ```json
 // tools/call → {"name":"query","arguments":{"sql":"DELETE FROM film WHERE film_id=1"}}
@@ -72,7 +98,7 @@ There are two independent guards. The SQL-AST gate is the fast, first line: it p
 | `npm run build` | Compile TS → `dist/` (`tsc`) |
 | `npm start` | Run the compiled server (`node dist/index.js`) |
 | `npm run test:smoke` | Build + run the end-to-end MCP smoke test |
-| `npm test` | Unit tests (vitest) — the SQL-AST read-only gate, no DB required |
+| `npm test` | Unit tests (vitest) — the SQL safety gates (read-only + allow-lists), no DB required |
 
 > `tsx` is a dev-only convenience and depends on platform-native esbuild. The committed path — `npm run build` → `node dist/index.js` — has no native dependencies and runs anywhere.
 
@@ -99,7 +125,9 @@ If the database is unreachable, the smoke test fails with a clean message (`conn
 3. `SELECT title FROM film LIMIT 5` returns 5 rows
 4. `DELETE FROM film ...` is rejected by the SQL-AST gate (not merely by the DB)
 
-`test/readonly.test.ts` unit-tests the gate itself (vitest, no DB needed): 28 cases covering SELECT/DESCRIBE/EXPLAIN-SELECT allow, every write statement deny, multi-statement all-or-nothing, and unparseable/empty SQL deny-by-default.
+`test/readonly.test.ts` unit-tests the read-only gate (vitest, no DB needed): 28 cases covering SELECT/DESCRIBE/EXPLAIN-SELECT allow, every write statement deny, multi-statement all-or-nothing, and unparseable/empty SQL deny-by-default.
+
+`test/allowlist.test.ts` unit-tests the table/column allow-list gates (25 cases): allowed tables + columns pass, disallowed table/column rejected, CTE and alias resolution, `SELECT *` rejected under a column allow-list, and multi-table unqualified columns rejected as ambiguous.
 
 ```bash
 npm test          # unit tests (no DB required)
@@ -121,15 +149,17 @@ Exit code `0` on success, `1` on failure. `DATABASE_URL` is read from the enviro
 ```
 src/
   index.ts          # entrypoint: McpServer + StdioServerTransport
-  config.ts         # DATABASE_URL (env-overridable)
+  config.ts         # DATABASE_URL + ALLOWED_TABLES + ALLOWED_COLUMNS (env-overridable)
   db/pool.ts        # pg connection pool
-  tools/query.ts    # the `query` tool (registerTool + handler, SQL-AST gate first)
-  sql-safety/       # SQL-AST inspection: readonly gate (parses + classifies statements)
+  tools/query.ts    # the `query` tool (registerTool + handler; 3 gates: readonly, tables, columns)
+  sql-safety/
+    readonly.ts     # read-only gate (parses + classifies statements)
+    allowlist.ts    # table/column allow-list gates (AST walk + alias/CTE resolution)
   auth/             # planned: OAuth 2.1 + JWT
   audit/            # planned: query audit logging
 sql/                # Postgres bootstrap (schema, data, read-only role)
 scripts/            # QA / smoke test harnesses
-test/               # unit tests (vitest)
+test/               # unit tests (vitest: readonly + allowlist gates)
 .github/workflows/  # CI
 ```
 

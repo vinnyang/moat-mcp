@@ -1,7 +1,15 @@
 import { z } from "zod/v4";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { pool } from "../db/pool.js";
-import { assertReadOnly } from "../sql-safety/readonly.js";
+import { config } from "../config.js";
+import {
+  parseStatements,
+  assertReadOnlyStatements,
+} from "../sql-safety/readonly.js";
+import {
+  assertTablesAllowed,
+  assertColumnsAllowed,
+} from "../sql-safety/allowlist.js";
 
 const QueryArgsSchema = z.object({
   sql: z
@@ -14,6 +22,13 @@ const QueryArgsSchema = z.object({
     .describe("Optional positional parameters for the query."),
 });
 
+function blocked(reason: string) {
+  return {
+    content: [{ type: "text" as const, text: `Blocked: ${reason}` }],
+    isError: true,
+  };
+}
+
 export function registerQueryTool(server: McpServer): void {
   server.registerTool(
     "query",
@@ -25,13 +40,28 @@ export function registerQueryTool(server: McpServer): void {
       inputSchema: QueryArgsSchema,
     },
     async ({ sql, params = [] }, extra) => {
-      const gate = assertReadOnly(sql);
-      if (!gate.ok) {
-        return {
-          content: [{ type: "text", text: `Blocked: ${gate.reason}` }],
-          isError: true,
-        };
+      const parsed = parseStatements(sql);
+      if (!parsed.ok) return blocked(parsed.reason);
+
+      const readOnly = assertReadOnlyStatements(parsed.statements);
+      if (!readOnly.ok) return blocked(readOnly.reason);
+
+      if (config.allowedTables) {
+        const tables = assertTablesAllowed(
+          parsed.statements,
+          config.allowedTables,
+        );
+        if (!tables.ok) return blocked(tables.reason);
       }
+
+      if (config.allowedColumns) {
+        const columns = assertColumnsAllowed(
+          parsed.statements,
+          config.allowedColumns,
+        );
+        if (!columns.ok) return blocked(columns.reason);
+      }
+
       const client = await pool.connect();
       try {
         await client.query("BEGIN TRANSACTION READ ONLY");
