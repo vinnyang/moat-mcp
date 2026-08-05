@@ -65,6 +65,28 @@ if (sel.isError) {
   }
 }
 
+const cnt = await callQuery("SELECT count(*) AS c FROM film");
+if (cnt.isError) {
+  fail("count failed: " + cnt.text.slice(0, 150));
+} else {
+  let parsed;
+  try {
+    parsed = JSON.parse(cnt.text);
+  } catch {
+    fail("count returned non-JSON: " + cnt.text.slice(0, 150));
+    parsed = null;
+  }
+  if (parsed && parsed.rowCount === 1 && String(parsed.rows[0]?.c) === "194") {
+    ok("RLS: mcp_readonly sees 194/1000 film rows (rating='PG')");
+  } else {
+    fail(
+      "expected RLS-filtered count 194, got " +
+        JSON.stringify(parsed?.rows) +
+        " — is sql/99-rls-policies.sql applied to the database?",
+    );
+  }
+}
+
 const del = await callQuery("DELETE FROM film WHERE title = 'ACADEMY DINOSAUR'");
 if (del.isError && del.text.includes("Blocked")) {
   ok("write blocked by SQL-AST gate: " + del.text.slice(0, 150));

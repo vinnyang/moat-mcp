@@ -2,7 +2,7 @@
 
 A security-hardened Postgres MCP server that governs safe, read-only access for LLM agents — read-only enforcement, SQL-AST inspection, table/column allow-listing, Row-Level Security, OAuth 2.1, and full query audit logging.
 
-**Status: read-only `query` tool with SQL-AST inspection is complete and CI-tested.**
+**Status: read-only `query` tool with SQL-AST inspection, table/column allow-lists, and Row-Level Security is complete and CI-tested.**
 
 ## What it is
 
@@ -17,6 +17,7 @@ moat-mcp server (node dist/index.js)
         │  └─ SQL-AST gate: parse + classify (rejects writes up front)
         ▼
 pg connection pool ──► Postgres (moat_mcp DB, mcp_readonly role)
+                        ├─ Row-Level Security (policies filter rows per role)
                         └─ BEGIN TRANSACTION READ ONLY (DB-level backstop)
 ```
 
@@ -48,12 +49,13 @@ npx @modelcontextprotocol/inspector node dist/index.js
 | SQL-AST gate | `node-sql-parser` parses + classifies every statement; writes are rejected **before** any DB call |
 | Table allow-list | `ALLOWED_TABLES` env — queries referencing any other table are blocked up front |
 | Column allow-list | `ALLOWED_COLUMNS` env — queries referencing disallowed columns (or `SELECT *`) are blocked up front |
+| Row-Level Security | `sql/99-rls-policies.sql` — Postgres itself filters rows per role (RLS); `mcp_readonly` only ever sees permitted rows, even for `SELECT *` |
 | Read-only hint | `annotations: { readOnlyHint: true }` advertised in `tools/list` |
 | Enforcement | `BEGIN TRANSACTION READ ONLY` — Postgres rejects any write statement (backstop) |
 | Result | JSON: `{ rowCount, rows }` |
 | Errors | Structured `{ content, isError: true }` so LLMs can read and self-correct |
 
-There are three independent guards. The SQL-AST gate is the fast, first line: it parses the SQL and refuses `INSERT`/`UPDATE`/`DELETE`/`CREATE`/`DROP`/`ALTER`/`TRUNCATE` with a `Blocked:` error, consuming no DB connection. The optional table/column allow-lists enforce *which data* the agent may touch — also before any DB call, and also structured as `Blocked:` errors. The read-only transaction is the final backstop — even if a write or disallowed reference slips past the app layer, Postgres itself refuses. Unknown/parse-failing statements are **denied by default**. Multi-statement SQL requires every statement to pass every gate.
+There are four independent guards. The SQL-AST gate is the fast, first line: it parses the SQL and refuses `INSERT`/`UPDATE`/`DELETE`/`CREATE`/`DROP`/`ALTER`/`TRUNCATE` with a `Blocked:` error, consuming no DB connection. The optional table/column allow-lists enforce *which data* the agent may touch — also before any DB call, and also structured as `Blocked:` errors. Row-Level Security is a database-side guard: a policy on the `film` table makes Postgres hide every row that fails `rating = 'PG'` from the `mcp_readonly` role — the app layer never parses or knows the predicate, so it applies to *every* query, including ones the app gates can't reason about (e.g. `SELECT *`). The read-only transaction is the final backstop — even if a write slips past the app layer, Postgres itself refuses. Unknown/parse-failing statements are **denied by default**. Multi-statement SQL requires every statement to pass every gate.
 
 ### Allow-lists
 
@@ -111,8 +113,9 @@ ALLOWED_COLUMNS="film.title,film.length,category.name"  # only these table.colum
 | `pagila-schema.sql` | Pagila (Sakila) schema — `film`, `customer`, etc. |
 | `pagila-data.sql` | Seed data (~1000 films) |
 | `99-readonly-role.sql` | Creates `mcp_readonly` role + SELECT grants (idempotent) |
+| `99-rls-policies.sql` | Enables Row-Level Security on `film`; policy shows `mcp_readonly` only `rating = 'PG'` rows |
 
-Docker runs these in alphabetical order on **first boot of an empty volume** only. The `99-` prefix guarantees the role is created after tables exist. Re-running the role script is safe.
+Docker runs these in alphabetical order on **first boot of an empty volume** only. The `99-` prefix guarantees the role is created after tables exist. Re-running the role script is safe. For an existing database, apply the RLS file manually (`psql -f sql/99-rls-policies.sql` as a superuser) — it is idempotent except for `CREATE POLICY`, which fails if the policy already exists.
 
 If the database is unreachable, the smoke test fails with a clean message (`connect ECONNREFUSED`) rather than crashing — the server and test are designed to degrade gracefully.
 
@@ -123,7 +126,8 @@ If the database is unreachable, the smoke test fails with a clean message (`conn
 1. the `query` tool is advertised
 2. `readOnlyHint` annotation is present
 3. `SELECT title FROM film LIMIT 5` returns 5 rows
-4. `DELETE FROM film ...` is rejected by the SQL-AST gate (not merely by the DB)
+4. `SELECT count(*) FROM film` returns `194` — Row-Level Security is active and `mcp_readonly` only sees `rating = 'PG'` rows
+5. `DELETE FROM film ...` is rejected by the SQL-AST gate (not merely by the DB)
 
 `test/readonly.test.ts` unit-tests the read-only gate (vitest, no DB needed): 28 cases covering SELECT/DESCRIBE/EXPLAIN-SELECT allow, every write statement deny, multi-statement all-or-nothing, and unparseable/empty SQL deny-by-default.
 
@@ -157,7 +161,7 @@ src/
     allowlist.ts    # table/column allow-list gates (AST walk + alias/CTE resolution)
   auth/             # planned: OAuth 2.1 + JWT
   audit/            # planned: query audit logging
-sql/                # Postgres bootstrap (schema, data, read-only role)
+sql/                # Postgres bootstrap (schema, data, read-only role, RLS policies)
 scripts/            # QA / smoke test harnesses
 test/               # unit tests (vitest: readonly + allowlist gates)
 .github/workflows/  # CI
