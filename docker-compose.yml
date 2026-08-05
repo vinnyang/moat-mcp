@@ -1,0 +1,36 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: moat-mcp-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: moat_dev_password
+      POSTGRES_DB: moat_mcp
+    ports:
+      - "5432:5432"
+    volumes:
+      - moat_pgdata:/var/lib/postgresql/data
+      - ./sql:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d moat_mcp"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  moat-mcp:
+    build: .
+    container_name: moat-mcp-server
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://mcp_readonly:${MCP_READONLY_PASSWORD:-moat_readonly_dev}@postgres:5432/moat_mcp
+      MCP_TRANSPORT: ${MCP_TRANSPORT:-http}
+      MCP_PORT: ${MCP_PORT:-3333}
+      JWT_ISSUER: ${JWT_ISSUER:-http://localhost:3333}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-moat-mcp}
+    ports:
+      - "3333:3333"
+
+volumes:
+  moat_pgdata:
