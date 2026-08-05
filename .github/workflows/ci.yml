@@ -22,13 +22,23 @@ jobs:
         volumes:
           - ${{ github.workspace }}/sql:/docker-entrypoint-initdb.d:ro
         options: >-
-          --health-cmd "pg_isready -U postgres -d moat_mcp >/dev/null && psql -U postgres -d moat_mcp -tAc 'SELECT count(*) FROM film' | grep -q 1000"
+          --health-cmd "pg_isready -U postgres -d moat_mcp"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 30
 
     steps:
       - uses: actions/checkout@v4
+
+      # The postgres service container boots before checkout, so the bind-mounted
+      # sql/ dir is empty when initdb.d runs and the schema never loads. Load it
+      # explicitly after checkout via docker exec (files are bind-mounted live).
+      - name: Load schema + data + roles + RLS into postgres
+        run: |
+          docker exec postgres psql -U postgres -d moat_mcp -v ON_ERROR_STOP=1 -f /docker-entrypoint-initdb.d/pagila-schema.sql
+          docker exec postgres psql -U postgres -d moat_mcp -v ON_ERROR_STOP=1 -f /docker-entrypoint-initdb.d/pagila-data.sql
+          docker exec postgres psql -U postgres -d moat_mcp -v ON_ERROR_STOP=1 -f /docker-entrypoint-initdb.d/99-readonly-role.sql
+          docker exec postgres psql -U postgres -d moat_mcp -v ON_ERROR_STOP=1 -f /docker-entrypoint-initdb.d/99-rls-policies.sql
 
       - uses: actions/setup-node@v4
         with:
@@ -45,5 +55,10 @@ jobs:
 
       - name: Smoke test (build + MCP stdio query tool)
         run: npm run test:smoke
+        env:
+          DATABASE_URL: postgres://mcp_readonly:moat_readonly_dev@127.0.0.1:5432/moat_mcp
+
+      - name: OAuth 2.1 + JWT smoke (full auth flow over HTTP)
+        run: npm run test:smoke:oauth
         env:
           DATABASE_URL: postgres://mcp_readonly:moat_readonly_dev@127.0.0.1:5432/moat_mcp
