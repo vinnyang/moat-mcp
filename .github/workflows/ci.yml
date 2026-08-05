@@ -39,6 +39,9 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      - name: Unit tests
+        run: npm test
+
       - name: Smoke test (build + MCP stdio query tool)
         run: npm run test:smoke
         env:

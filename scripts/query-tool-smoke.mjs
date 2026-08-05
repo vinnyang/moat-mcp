@@ -66,9 +66,13 @@ if (sel.isError) {
 }
 
 const del = await callQuery("DELETE FROM film WHERE title = 'ACADEMY DINOSAUR'");
-if (del.isError) ok("write blocked (isError): " + del.text.slice(0, 150));
-else fail("write was NOT blocked: " + del.text.slice(0, 150));
-
+if (del.isError && del.text.includes("Blocked")) {
+  ok("write blocked by SQL-AST gate: " + del.text.slice(0, 150));
+} else if (del.isError) {
+  fail("write blocked, but not by SQL-AST gate (expected 'Blocked:' message): " + del.text.slice(0, 150));
+} else {
+  fail("write was NOT blocked: " + del.text.slice(0, 150));
+}
 await transport.close();
 console.log(failures === 0 ? "\nALL CHECKS PASSED" : `\n${failures} CHECK(S) FAILED`);
 process.exit(failures === 0 ? 0 : 1);

@@ -2,11 +2,11 @@
 
 A security-hardened Postgres MCP server that governs safe, read-only access for LLM agents — read-only enforcement, SQL-AST inspection, table/column allow-listing, Row-Level Security, OAuth 2.1, and full query audit logging.
 
-**Status: read-only `query` tool is complete and CI-tested.**
+**Status: read-only `query` tool with SQL-AST inspection is complete and CI-tested.**
 
 ## What it is
 
-`moat-mcp` exposes a single MCP tool, `query`, that lets AI clients run read-only SQL against a Postgres business database. The read-only guarantee is enforced by Postgres itself — not by trusting the client.
+`moat-mcp` exposes a single MCP tool, `query`, that lets AI clients run read-only SQL against a Postgres business database. The read-only guarantee is enforced in two layers — the application parses and rejects write statements before they reach the database, and Postgres itself refuses to execute writes inside a read-only transaction.
 
 ```
 AI client (Claude / MCP Inspector / any MCP client)
@@ -14,8 +14,10 @@ AI client (Claude / MCP Inspector / any MCP client)
         ▼
 moat-mcp server (node dist/index.js)
         │  registerTool("query", schema, handler)
+        │  └─ SQL-AST gate: parse + classify (rejects writes up front)
         ▼
 pg connection pool ──► Postgres (moat_mcp DB, mcp_readonly role)
+                        └─ BEGIN TRANSACTION READ ONLY (DB-level backstop)
 ```
 
 ## Quick start
@@ -43,12 +45,18 @@ npx @modelcontextprotocol/inspector node dist/index.js
 | Aspect | Implementation |
 |---|---|
 | Input validation | Zod schema — `sql: string`, optional positional `params` |
+| SQL-AST gate | `node-sql-parser` parses + classifies every statement; writes are rejected **before** any DB call |
 | Read-only hint | `annotations: { readOnlyHint: true }` advertised in `tools/list` |
-| Enforcement | `BEGIN TRANSACTION READ ONLY` — Postgres rejects any write statement |
+| Enforcement | `BEGIN TRANSACTION READ ONLY` — Postgres rejects any write statement (backstop) |
 | Result | JSON: `{ rowCount, rows }` |
 | Errors | Structured `{ content, isError: true }` so LLMs can read and self-correct |
 
-The hint is metadata for well-behaved clients; the transaction is the actual lock. A `DELETE` inside a read-only transaction fails with `cannot execute DELETE in a read-only transaction`.
+There are two independent guards. The SQL-AST gate is the fast, first line: it parses the SQL and refuses `INSERT`/`UPDATE`/`DELETE`/`CREATE`/`DROP`/`ALTER`/`TRUNCATE` with a `Blocked:` error, consuming no DB connection. The read-only transaction is the second-line backstop — even if a write slips past parsing (or the gate is bypassed), Postgres itself refuses with `cannot execute DELETE in a read-only transaction`. Unknown/parse-failing statements are **denied by default**. Multi-statement SQL requires every statement to be read-only.
+
+```json
+// tools/call → {"name":"query","arguments":{"sql":"DELETE FROM film WHERE film_id=1"}}
+{ "content": [{ "type": "text", "text": "Blocked: statement type 'delete' is not read-only" }], "isError": true }
+```
 
 ```json
 // tools/call → {"name":"query","arguments":{"sql":"SELECT title FROM film LIMIT 5"}}
@@ -64,7 +72,7 @@ The hint is metadata for well-behaved clients; the transaction is the actual loc
 | `npm run build` | Compile TS → `dist/` (`tsc`) |
 | `npm start` | Run the compiled server (`node dist/index.js`) |
 | `npm run test:smoke` | Build + run the end-to-end MCP smoke test |
-| `npm test` | Unit tests (vitest — populated as tests are added) |
+| `npm test` | Unit tests (vitest) — the SQL-AST read-only gate, no DB required |
 
 > `tsx` is a dev-only convenience and depends on platform-native esbuild. The committed path — `npm run build` → `node dist/index.js` — has no native dependencies and runs anywhere.
 
@@ -89,9 +97,12 @@ If the database is unreachable, the smoke test fails with a clean message (`conn
 1. the `query` tool is advertised
 2. `readOnlyHint` annotation is present
 3. `SELECT title FROM film LIMIT 5` returns 5 rows
-4. `DELETE FROM film ...` is rejected by the read-only transaction
+4. `DELETE FROM film ...` is rejected by the SQL-AST gate (not merely by the DB)
+
+`test/readonly.test.ts` unit-tests the gate itself (vitest, no DB needed): 28 cases covering SELECT/DESCRIBE/EXPLAIN-SELECT allow, every write statement deny, multi-statement all-or-nothing, and unparseable/empty SQL deny-by-default.
 
 ```bash
+npm test          # unit tests (no DB required)
 npm run test:smoke
 ```
 
@@ -103,7 +114,7 @@ Exit code `0` on success, `1` on failure. `DATABASE_URL` is read from the enviro
 
 1. Starts a `postgres:16` service container, mounting `sql/` as init scripts
 2. Health-gate waits until `film` has 1000 rows (never races the data load)
-3. `npm ci` → `npm run typecheck` → `npm run test:smoke`
+3. `npm ci` → `npm run typecheck` → `npm test` → `npm run test:smoke`
 
 ## Project structure
 
@@ -112,9 +123,9 @@ src/
   index.ts          # entrypoint: McpServer + StdioServerTransport
   config.ts         # DATABASE_URL (env-overridable)
   db/pool.ts        # pg connection pool
-  tools/query.ts    # the `query` tool (registerTool + handler)
+  tools/query.ts    # the `query` tool (registerTool + handler, SQL-AST gate first)
+  sql-safety/       # SQL-AST inspection: readonly gate (parses + classifies statements)
   auth/             # planned: OAuth 2.1 + JWT
-  sql-safety/       # planned: SQL-AST inspection, allow-lists
   audit/            # planned: query audit logging
 sql/                # Postgres bootstrap (schema, data, read-only role)
 scripts/            # QA / smoke test harnesses

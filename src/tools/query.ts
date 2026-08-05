@@ -1,6 +1,7 @@
 import { z } from "zod/v4";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { pool } from "../db/pool.js";
+import { assertReadOnly } from "../sql-safety/readonly.js";
 
 const QueryArgsSchema = z.object({
   sql: z
@@ -24,6 +25,13 @@ export function registerQueryTool(server: McpServer): void {
       inputSchema: QueryArgsSchema,
     },
     async ({ sql, params = [] }, extra) => {
+      const gate = assertReadOnly(sql);
+      if (!gate.ok) {
+        return {
+          content: [{ type: "text", text: `Blocked: ${gate.reason}` }],
+          isError: true,
+        };
+      }
       const client = await pool.connect();
       try {
         await client.query("BEGIN TRANSACTION READ ONLY");
