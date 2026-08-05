@@ -41,7 +41,7 @@ jobs:
           cat sql/99-readonly-role.sql | docker exec -i "$PG_CONTAINER" psql -U postgres -d moat_mcp -v ON_ERROR_STOP=1
           cat sql/99-rls-policies.sql | docker exec -i "$PG_CONTAINER" psql -U postgres -d moat_mcp -v ON_ERROR_STOP=1
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 20
           cache: npm
