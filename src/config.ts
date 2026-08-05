@@ -1,3 +1,8 @@
+function positiveInt(value: string | undefined, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
 function parseSet(value: string | undefined): Set<string> | null {
   if (!value) return null;
   const items = value
@@ -30,4 +35,15 @@ export const config = {
     "postgres://mcp_readonly:moat_readonly_dev@127.0.0.1:5432/moat_mcp",
   allowedTables: parseSet(process.env.ALLOWED_TABLES),
   allowedColumns: parseColumnMap(process.env.ALLOWED_COLUMNS),
+  transport: process.argv.includes("--http")
+    ? "http"
+    : process.argv.includes("--stdio")
+      ? "stdio"
+      : (process.env.MCP_TRANSPORT ?? "stdio"),
+  httpPort: positiveInt(process.env.MCP_PORT, 3333),
+  jwtSecret:
+    process.env.JWT_SECRET ?? "moat_dev_insecure_secret_change_me",
+  jwtIssuer: process.env.JWT_ISSUER ?? "http://localhost:3333",
+  jwtAudience: process.env.JWT_AUDIENCE ?? "moat-mcp",
+  jwtExpiresInSec: positiveInt(process.env.JWT_EXPIRES_IN, 3600),
 } as const;

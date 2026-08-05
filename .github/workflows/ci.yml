@@ -58,4 +58,8 @@ jobs:
         run: npm run test:smoke
         env:
           DATABASE_URL: postgres://mcp_readonly:moat_readonly_dev@127.0.0.1:5432/moat_mcp
-      # OAuth 2.1 + JWT smoke (npm run test:smoke:oauth) re-added once M5 lands.
+
+      - name: OAuth 2.1 + JWT smoke (full auth flow over HTTP)
+        run: npm run test:smoke:oauth
+        env:
+          DATABASE_URL: postgres://mcp_readonly:moat_readonly_dev@127.0.0.1:5432/moat_mcp

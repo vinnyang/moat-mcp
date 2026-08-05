@@ -2,7 +2,7 @@
 
 A security-hardened Postgres MCP server that governs safe, read-only access for LLM agents — read-only enforcement, SQL-AST inspection, table/column allow-listing, Row-Level Security, OAuth 2.1, and full query audit logging.
 
-**Status: read-only `query` tool with SQL-AST inspection, table/column allow-lists, and Row-Level Security is complete and CI-tested.**
+**Status: read-only `query` tool with SQL-AST inspection, table/column allow-lists, Row-Level Security is complete and CI-tested; OAuth 2.1 + JWT identity (control plane) is complete and CI-tested.**
 
 ## What it is
 
@@ -40,6 +40,50 @@ The server speaks the Model Context Protocol over stdio. Connect any MCP client 
 ```bash
 npx @modelcontextprotocol/inspector node dist/index.js
 ```
+
+## Transports
+
+Two transports, selected automatically:
+
+| Transport | How to run | Use when |
+|---|---|---|
+| stdio | `npm start` (default) | Spawned as a child process by a trusted MCP client |
+| HTTP (OAuth 2.1) | `node dist/index.js --http` | Remote/agent access over the network, with authentication |
+
+With `--http`, the server exposes an OAuth 2.1 authorization server (`/.well-known/oauth-authorization-server`) and an authenticated, streamable-HTTP `/mcp` endpoint. Any MCP client that supports [OAuth authentication](https://modelcontextprotocol.io/specification/2025-06-18/basic/transport#authentication) can connect; unauthenticated and invalid-token requests are rejected with `401`. Over stdio, authentication is implicit — the transport is the trust boundary.
+
+### OAuth 2.1 + JWT (control plane)
+
+`moat-mcp` is its own OAuth 2.1 authorization server. An agent does the full dance before it is allowed to call `query`:
+
+```
+Discovery  ── GET  /.well-known/oauth-authorization-server   → endpoints
+Register   ── POST /register (RFC 7591 dynamic)              → client_id
+Authorize  ── GET  /authorize?response_type=code (PKCE S256) → authorization code
+
+Token      ── POST token: authorization_code + PKCE verifier → JWT access token + refresh token
+
+Access     ── POST /mcp  Authorization: Bearer <JWT>         → 401 unless the JWT verifies
+```
+
+Endpoints live under `/.well-known/` per the OAuth 2.1 + Protected Resource Metadata spec. Key properties:
+
+- **PKCE (S256)** required — public client code exchange can't be hijacked.
+- **Dynamic client registration** — agents register themselves; the store is in-memory (reset on restart).
+- **JWT access tokens** — HS256, signed with `JWT_SECRET`, carry `iss`/`aud`/`sub`/`scope`/`exp`. `requireBearerAuth` (from the MCP SDK) validates signature + issuer + audience + expiry and maps failures to `401`.
+- **Refresh token rotation** — every refresh returns a new refresh token and invalidates the old one (single-use).
+- **Missing `Authorization` or a non-JWT token ⇒ `401`; valid token but wrong `MCP_SESSION`/non-JSON `Accept` ⇒ `400`/`406` per the MCP spec.**
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `MCP_TRANSPORT` | `stdio` | `stdio` or `http` (or use `--http` flag) |
+| `MCP_PORT` | `3333` | HTTP listen port |
+| `JWT_SECRET` | dev default | HS256 signing secret — **set a strong value outside dev** |
+| `JWT_ISSUER` | `http://localhost:3333` | `iss`, must match the server's public URL |
+| `JWT_AUDIENCE` | `moat-mcp` | `aud`, must match what verifiers expect |
+| `JWT_EXPIRES_IN_SEC` | `3600` | Access-token lifetime |
+
+`MCP_TRANSPORT`, `MCP_PORT`, `JWT_ISSUER` and `JWT_AUDIENCE` are already wired into `docker-compose.yml`.
 
 ## The `query` tool
 
@@ -98,9 +142,11 @@ ALLOWED_COLUMNS="film.title,film.length,category.name"  # only these table.colum
 | `npm run dev:stdio` | Run from source with hot reload (`tsx src/index.ts`) |
 | `npm run typecheck` | Type-check without emitting (`tsc --noEmit`) |
 | `npm run build` | Compile TS → `dist/` (`tsc`) |
-| `npm start` | Run the compiled server (`node dist/index.js`) |
-| `npm run test:smoke` | Build + run the end-to-end MCP smoke test |
-| `npm test` | Unit tests (vitest) — the SQL safety gates (read-only + allow-lists), no DB required |
+| `npm start` | Run the compiled server over stdio (`node dist/index.js`) |
+| `node dist/index.js --http` | Run over HTTP with OAuth 2.1 (`MCP_TRANSPORT=http` also works) |
+| `npm run test:smoke` | Build + run the end-to-end MCP stdio smoke test |
+| `npm run test:smoke:oauth` | Build + run the full OAuth 2.1 + JWT smoke test over HTTP |
+| `npm test` | Unit tests (vitest) — SQL safety gates + auth/JWT, no DB required |
 
 > `tsx` is a dev-only convenience and depends on platform-native esbuild. The committed path — `npm run build` → `node dist/index.js` — has no native dependencies and runs anywhere.
 
@@ -129,13 +175,26 @@ If the database is unreachable, the smoke test fails with a clean message (`conn
 4. `SELECT count(*) FROM film` returns `194` — Row-Level Security is active and `mcp_readonly` only sees `rating = 'PG'` rows
 5. `DELETE FROM film ...` is rejected by the SQL-AST gate (not merely by the DB)
 
+`scripts/oauth-smoke.mjs` drives the compiled server over real HTTP and asserts the complete OAuth 2.1 flow a remote agent would run:
+
+1. discovery exposes authorization/token/registration endpoints
+2. dynamic client registration returns a `client_id`
+3. PKCE authorization redirect returns a `code` + matching `state`
+4. code + verifier exchange yields a JWT access token and refresh token
+5. authenticated `initialize` / `tools/list` / `tools/call query` succeed over streamable HTTP (M1–M5 stack together)
+6. refresh token exchange rotates the token
+7. missing or invalid `Authorization` is rejected with `401`
+
 `test/readonly.test.ts` unit-tests the read-only gate (vitest, no DB needed): 28 cases covering SELECT/DESCRIBE/EXPLAIN-SELECT allow, every write statement deny, multi-statement all-or-nothing, and unparseable/empty SQL deny-by-default.
 
 `test/allowlist.test.ts` unit-tests the table/column allow-list gates (25 cases): allowed tables + columns pass, disallowed table/column rejected, CTE and alias resolution, `SELECT *` rejected under a column allow-list, and multi-table unqualified columns rejected as ambiguous.
 
+`test/auth.test.ts` unit-tests the JWT + OAuth provider (8 cases): token round-trip; wrong issuer/audience/expiry/secret all rejected; the full authorize→code→token→refresh flow with single-use rotation; a code issued to a different client rejected; an unregistered `redirect_uri` rejected.
+
 ```bash
 npm test          # unit tests (no DB required)
-npm run test:smoke
+npm run test:smoke          # stdio E2E (DB required)
+npm run test:smoke:oauth    # OAuth 2.1 + JWT E2E over HTTP (DB required)
 ```
 
 Exit code `0` on success, `1` on failure. `DATABASE_URL` is read from the environment (dev fallback provided), with a 30s watchdog so it never hangs.
@@ -146,24 +205,28 @@ Exit code `0` on success, `1` on failure. `DATABASE_URL` is read from the enviro
 
 1. Starts a `postgres:16` service container, mounting `sql/` as init scripts
 2. Health-gate waits until `film` has 1000 rows (never races the data load)
-3. `npm ci` → `npm run typecheck` → `npm test` → `npm run test:smoke`
+3. `npm ci` → `npm run typecheck` → `npm test` → `npm run test:smoke` → `npm run test:smoke:oauth`
 
 ## Project structure
 
 ```
 src/
-  index.ts          # entrypoint: McpServer + StdioServerTransport
-  config.ts         # DATABASE_URL + ALLOWED_TABLES + ALLOWED_COLUMNS (env-overridable)
+  index.ts          # entrypoint: transport dispatch (stdio vs HTTP), McpServer
+  config.ts         # DATABASE_URL, allow-lists, transport + JWT settings (env-overridable)
   db/pool.ts        # pg connection pool
   tools/query.ts    # the `query` tool (registerTool + handler; 3 gates: readonly, tables, columns)
   sql-safety/
     readonly.ts     # read-only gate (parses + classifies statements)
     allowlist.ts    # table/column allow-list gates (AST walk + alias/CTE resolution)
-  auth/             # planned: OAuth 2.1 + JWT
+  auth/
+    jwt.ts          # JWT issue + verify (HS256, iss/aud/exp), PKCE + random-token helpers
+    provider.ts     # OAuth 2.1 provider: in-memory client store, authorize/code/refresh/revoke
+  http.ts           # express app: OAuth router, bearer auth, streamable-HTTP /mcp, /healthz
+  stdio.ts          # stdio server (default transport)
   audit/            # planned: query audit logging
 sql/                # Postgres bootstrap (schema, data, read-only role, RLS policies)
 scripts/            # QA / smoke test harnesses
-test/               # unit tests (vitest: readonly + allowlist gates)
+test/               # unit tests (vitest: readonly, allowlists, auth)
 .github/workflows/  # CI
 ```
 

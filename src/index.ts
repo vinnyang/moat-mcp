@@ -1,13 +1,9 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { registerQueryTool } from "./tools/query.js";
+import { config } from "./config.js";
 
-const server = new McpServer({
-  name: "moat-mcp",
-  version: "0.1.0",
-});
-
-registerQueryTool(server);
-
-const transport = new StdioServerTransport();
-await server.connect(transport);
+if (config.transport === "http") {
+  const { startHttpServer } = await import("./http.js");
+  await startHttpServer();
+} else {
+  const { startStdioServer } = await import("./stdio.js");
+  await startStdioServer();
+}

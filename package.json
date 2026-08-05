@@ -27,7 +27,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:redteam": "vitest run test/redteam.test.ts",
-    "test:smoke": "npm run build && node scripts/query-tool-smoke.mjs"
+    "test:smoke": "npm run build && node scripts/query-tool-smoke.mjs",
+    "test:smoke:oauth": "npm run build && node scripts/oauth-smoke.mjs"
   },
   "keywords": [
     "mcp",
@@ -47,6 +48,7 @@
     "zod": "^3.24.0"
   },
   "devDependencies": {
+    "@types/express": "^5.0.6",
     "@types/node": "^22.0.0",
     "@types/pg": "^8.11.0",
     "tsx": "^4.19.0",
