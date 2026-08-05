@@ -1,0 +1,127 @@
+# moat-mcp
+
+A security-hardened Postgres MCP server that governs safe, read-only access for LLM agents — read-only enforcement, SQL-AST inspection, table/column allow-listing, Row-Level Security, OAuth 2.1, and full query audit logging.
+
+**Status: read-only `query` tool is complete and CI-tested.**
+
+## What it is
+
+`moat-mcp` exposes a single MCP tool, `query`, that lets AI clients run read-only SQL against a Postgres business database. The read-only guarantee is enforced by Postgres itself — not by trusting the client.
+
+```
+AI client (Claude / MCP Inspector / any MCP client)
+        │  JSON-RPC over stdio
+        ▼
+moat-mcp server (node dist/index.js)
+        │  registerTool("query", schema, handler)
+        ▼
+pg connection pool ──► Postgres (moat_mcp DB, mcp_readonly role)
+```
+
+## Quick start
+
+```bash
+# 1. Start Postgres with schema + data + read-only role (first boot only)
+docker compose up -d postgres
+
+# 2. Install and build
+npm ci
+npm run build
+
+# 3. Run the server over stdio
+npm start
+```
+
+The server speaks the Model Context Protocol over stdio. Connect any MCP client — [MCP Inspector](https://github.com/modelcontextprotocol/inspector) is the fastest way to try it:
+
+```bash
+npx @modelcontextprotocol/inspector node dist/index.js
+```
+
+## The `query` tool
+
+| Aspect | Implementation |
+|---|---|
+| Input validation | Zod schema — `sql: string`, optional positional `params` |
+| Read-only hint | `annotations: { readOnlyHint: true }` advertised in `tools/list` |
+| Enforcement | `BEGIN TRANSACTION READ ONLY` — Postgres rejects any write statement |
+| Result | JSON: `{ rowCount, rows }` |
+| Errors | Structured `{ content, isError: true }` so LLMs can read and self-correct |
+
+The hint is metadata for well-behaved clients; the transaction is the actual lock. A `DELETE` inside a read-only transaction fails with `cannot execute DELETE in a read-only transaction`.
+
+```json
+// tools/call → {"name":"query","arguments":{"sql":"SELECT title FROM film LIMIT 5"}}
+{ "content": [{ "type": "text", "text": "{\n  \"rowCount\": 5, ..." }] }
+```
+
+## Development
+
+| Command | Purpose |
+|---|---|
+| `npm run dev:stdio` | Run from source with hot reload (`tsx src/index.ts`) |
+| `npm run typecheck` | Type-check without emitting (`tsc --noEmit`) |
+| `npm run build` | Compile TS → `dist/` (`tsc`) |
+| `npm start` | Run the compiled server (`node dist/index.js`) |
+| `npm run test:smoke` | Build + run the end-to-end MCP smoke test |
+| `npm test` | Unit tests (vitest — populated as tests are added) |
+
+> `tsx` is a dev-only convenience and depends on platform-native esbuild. The committed path — `npm run build` → `node dist/index.js` — has no native dependencies and runs anywhere.
+
+## Database setup
+
+`sql/` contains everything needed to bootstrap a fresh Postgres:
+
+| File | Purpose |
+|---|---|
+| `pagila-schema.sql` | Pagila (Sakila) schema — `film`, `customer`, etc. |
+| `pagila-data.sql` | Seed data (~1000 films) |
+| `99-readonly-role.sql` | Creates `mcp_readonly` role + SELECT grants (idempotent) |
+
+Docker runs these in alphabetical order on **first boot of an empty volume** only. The `99-` prefix guarantees the role is created after tables exist. Re-running the role script is safe.
+
+If the database is unreachable, the smoke test fails with a clean message (`connect ECONNREFUSED`) rather than crashing — the server and test are designed to degrade gracefully.
+
+## Testing
+
+`scripts/query-tool-smoke.mjs` drives the compiled server over the real MCP stdio protocol (the same path MCP Inspector uses) and asserts:
+
+1. the `query` tool is advertised
+2. `readOnlyHint` annotation is present
+3. `SELECT title FROM film LIMIT 5` returns 5 rows
+4. `DELETE FROM film ...` is rejected by the read-only transaction
+
+```bash
+npm run test:smoke
+```
+
+Exit code `0` on success, `1` on failure. `DATABASE_URL` is read from the environment (dev fallback provided), with a 30s watchdog so it never hangs.
+
+## CI/CD
+
+`.github/workflows/ci.yml` runs on every push/PR to `main`:
+
+1. Starts a `postgres:16` service container, mounting `sql/` as init scripts
+2. Health-gate waits until `film` has 1000 rows (never races the data load)
+3. `npm ci` → `npm run typecheck` → `npm run test:smoke`
+
+## Project structure
+
+```
+src/
+  index.ts          # entrypoint: McpServer + StdioServerTransport
+  config.ts         # DATABASE_URL (env-overridable)
+  db/pool.ts        # pg connection pool
+  tools/query.ts    # the `query` tool (registerTool + handler)
+  auth/             # planned: OAuth 2.1 + JWT
+  sql-safety/       # planned: SQL-AST inspection, allow-lists
+  audit/            # planned: query audit logging
+sql/                # Postgres bootstrap (schema, data, read-only role)
+scripts/            # QA / smoke test harnesses
+test/               # unit tests (vitest)
+.github/workflows/  # CI
+```
+
+## License
+
+MIT

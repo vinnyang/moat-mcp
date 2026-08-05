@@ -26,7 +26,8 @@
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:redteam": "vitest run test/redteam.test.ts"
+    "test:redteam": "vitest run test/redteam.test.ts",
+    "test:smoke": "npm run build && node scripts/query-tool-smoke.mjs"
   },
   "keywords": [
     "mcp",
