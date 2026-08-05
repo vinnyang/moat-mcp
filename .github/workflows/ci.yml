@@ -19,8 +19,6 @@ jobs:
           POSTGRES_DB: moat_mcp
         ports:
           - 5432:5432
-        volumes:
-          - ${{ github.workspace }}/sql:/docker-entrypoint-initdb.d:ro
         options: >-
           --health-cmd "pg_isready -U postgres -d moat_mcp"
           --health-interval 5s
@@ -30,19 +28,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The postgres service container boots before checkout, so the bind-mounted
-      # sql/ dir is empty when initdb.d runs and the schema never loads. Load it
-      # explicitly after checkout via docker exec (files are bind-mounted live).
-      # Service containers get random names from Actions, so resolve the container
-      # ID from the image rather than assuming the hostname `postgres` is a name.
+      # The postgres service container boots before checkout, so the sql/ dir is
+      # empty when the entrypoint scans initdb.d and the schema never loads. The
+      # initdb.d mount is also frozen at boot, so stream the files from the
+      # checked-out workspace into psql instead of referencing paths in-container.
       - name: Load schema + data + roles + RLS into postgres
         run: |
           PG_CONTAINER="$(docker ps -qf ancestor=postgres:16)"
           echo "Using postgres container: ${PG_CONTAINER}"
-          docker exec "$PG_CONTAINER" psql -U postgres -d moat_mcp -v ON_ERROR_STOP=1 -f /docker-entrypoint-initdb.d/pagila-schema.sql
-          docker exec "$PG_CONTAINER" psql -U postgres -d moat_mcp -v ON_ERROR_STOP=1 -f /docker-entrypoint-initdb.d/pagila-data.sql
-          docker exec "$PG_CONTAINER" psql -U postgres -d moat_mcp -v ON_ERROR_STOP=1 -f /docker-entrypoint-initdb.d/99-readonly-role.sql
-          docker exec "$PG_CONTAINER" psql -U postgres -d moat_mcp -v ON_ERROR_STOP=1 -f /docker-entrypoint-initdb.d/99-rls-policies.sql
+          cat sql/pagila-schema.sql | docker exec -i "$PG_CONTAINER" psql -U postgres -d moat_mcp -v ON_ERROR_STOP=1
+          cat sql/pagila-data.sql | docker exec -i "$PG_CONTAINER" psql -U postgres -d moat_mcp -v ON_ERROR_STOP=1
+          cat sql/99-readonly-role.sql | docker exec -i "$PG_CONTAINER" psql -U postgres -d moat_mcp -v ON_ERROR_STOP=1
+          cat sql/99-rls-policies.sql | docker exec -i "$PG_CONTAINER" psql -U postgres -d moat_mcp -v ON_ERROR_STOP=1
 
       - uses: actions/setup-node@v4
         with:
