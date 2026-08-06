@@ -1,4 +1,4 @@
-# moat-mcp
+# moat-mcp [![CI](https://github.com/vinnyang/moat-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/vinnyang/moat-mcp/actions/workflows/ci.yml)
 
 A security-hardened Postgres MCP server that governs safe, read-only access for LLM agents — read-only enforcement, SQL-AST inspection, table/column allow-listing, Row-Level Security, OAuth 2.1, and full query audit logging.
 
