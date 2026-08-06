@@ -1,6 +1,5 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { Writable } from "node:stream";
 
 const DATABASE_URL =
   process.env.DATABASE_URL ??
@@ -12,27 +11,24 @@ const watchdog = setTimeout(() => {
 }, 30_000);
 watchdog.unref();
 
-// Capture the server's stderr (the audit stream) line-by-line.
-const auditLines = [];
-let stderrBuffer = "";
-const stderrSink = new Writable({
-  write(chunk, _enc, cb) {
-    stderrBuffer += chunk.toString();
-    let newline;
-    while ((newline = stderrBuffer.indexOf("\n")) >= 0) {
-      const line = stderrBuffer.slice(0, newline).trim();
-      stderrBuffer = stderrBuffer.slice(newline + 1);
-      if (line) auditLines.push(line);
-    }
-    cb();
-  },
-});
-
 const transport = new StdioClientTransport({
   command: "node",
   args: ["dist/index.js"],
   env: { ...process.env, DATABASE_URL },
-  stderr: stderrSink,
+  stderr: "pipe", // expose child stderr (the audit stream) via transport.stderr
+});
+// Capture the server's stderr (the append-only audit stream) line-by-line.
+const auditLines = [];
+transport.stderr.setEncoding("utf8");
+let stderrBuffer = "";
+transport.stderr.on("data", (chunk) => {
+  stderrBuffer += chunk;
+  let newline;
+  while ((newline = stderrBuffer.indexOf("\n")) >= 0) {
+    const line = stderrBuffer.slice(0, newline).trim();
+    stderrBuffer = stderrBuffer.slice(newline + 1);
+    if (line) auditLines.push(line);
+  }
 });
 const client = new Client(
   { name: "query-tool-smoke", version: "1.0.0" },
