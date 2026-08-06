@@ -2,7 +2,7 @@
 
 A security-hardened Postgres MCP server that governs safe, read-only access for LLM agents — read-only enforcement, SQL-AST inspection, table/column allow-listing, Row-Level Security, OAuth 2.1, and full query audit logging.
 
-**Status: read-only `query` tool with SQL-AST inspection, table/column allow-lists, Row-Level Security is complete and CI-tested; OAuth 2.1 + JWT identity (control plane) is complete and CI-tested.**
+**Status: read-only `query` tool with SQL-AST inspection, table/column allow-lists, Row-Level Security is complete and CI-tested; OAuth 2.1 + JWT identity (control plane) is complete and CI-tested; append-only query audit logging is complete and CI-tested.**
 
 ## What it is
 
@@ -135,6 +135,24 @@ ALLOWED_COLUMNS="film.title,film.length,category.name"  # only these table.colum
 { "content": [{ "type": "text", "text": "{\n  \"rowCount\": 5, ..." }] }
 ```
 
+## Audit logging
+
+Every `query` call — **success, blocked, or error** — appends exactly one record to an append-only audit stream on stderr. The module (`src/audit/audit.ts`) exposes a single write path (`auditLog`) and no update/delete/mutate path, so the trail is a ledger, not a scratchpad. Each record carries the plan's `audit_log` shape:
+
+```json
+{"id":1,"ts":"2026-08-05T02:06:38.775Z","caller_id":"stdio","tool":"query","sql_text":"SELECT title FROM film LIMIT 5","row_count":5,"duration_ms":3,"status":"success"}
+```
+
+- **`caller_id`** — the OAuth client id over HTTP (`extra.authInfo?.clientId`), or `"stdio"` when the transport is the trust boundary.
+- **Append-only** — the only public API is append; there is no update/delete path, and `id` is a monotonic sequence so records can't be silently reordered or erased.
+- **`status`** — `success` (ran), `blocked` (a gate rejected it before the DB), or `error` (ran but the DB raised). Blocked and failed calls are logged exactly like successes — an attack can't erase its own trail.
+- **Why stderr** — in stdio mode stdout carries the MCP JSON-RPC protocol; a stray line there would corrupt the stream. stderr is free on both transports. To keep a durable ledger, redirect it:
+
+```bash
+node dist/index.js 2>>audit.log      # append JSON lines to a file
+node dist/index.js --http 2> >(tee -a audit.log)   # or tee to a collector
+```
+
 ## Development
 
 | Command | Purpose |
@@ -174,6 +192,7 @@ If the database is unreachable, the smoke test fails with a clean message (`conn
 3. `SELECT title FROM film LIMIT 5` returns 5 rows
 4. `SELECT count(*) FROM film` returns `194` — Row-Level Security is active and `mcp_readonly` only sees `rating = 'PG'` rows
 5. `DELETE FROM film ...` is rejected by the SQL-AST gate (not merely by the DB)
+6. every call — including the blocked `DELETE` — appends an `audit` JSON line on stderr with the correct `status` + `row_count` (QA gate: 2 success + 1 blocked = 3 rows)
 
 `scripts/oauth-smoke.mjs` drives the compiled server over real HTTP and asserts the complete OAuth 2.1 flow a remote agent would run:
 
@@ -190,6 +209,8 @@ If the database is unreachable, the smoke test fails with a clean message (`conn
 `test/allowlist.test.ts` unit-tests the table/column allow-list gates (25 cases): allowed tables + columns pass, disallowed table/column rejected, CTE and alias resolution, `SELECT *` rejected under a column allow-list, and multi-table unqualified columns rejected as ambiguous.
 
 `test/auth.test.ts` unit-tests the JWT + OAuth provider (8 cases): token round-trip; wrong issuer/audience/expiry/secret all rejected; the full authorize→code→token→refresh flow with single-use rotation; a code issued to a different client rejected; an unregistered `redirect_uri` rejected.
+
+`test/audit.test.ts` unit-tests the append-only audit logger (5 cases): records get auto-assigned `id` + `ts`; ids are strictly increasing; optional `error` present for blocked/error only; `row_count` absent for blocked; `resetAuditSink` restores stderr. No DB or transport needed.
 
 ```bash
 npm test          # unit tests (no DB required)
@@ -223,7 +244,7 @@ src/
     provider.ts     # OAuth 2.1 provider: in-memory client store, authorize/code/refresh/revoke
   http.ts           # express app: OAuth router, bearer auth, streamable-HTTP /mcp, /healthz
   stdio.ts          # stdio server (default transport)
-  audit/            # planned: query audit logging
+  audit/audit.ts    # append-only query audit logger (success/blocked/error → stderr JSON)
 sql/                # Postgres bootstrap (schema, data, read-only role, RLS policies)
 scripts/            # QA / smoke test harnesses
 test/               # unit tests (vitest: readonly, allowlists, auth)

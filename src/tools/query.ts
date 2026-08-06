@@ -1,5 +1,6 @@
 import { z } from "zod/v4";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { pool } from "../db/pool.js";
 import { config } from "../config.js";
 import {
@@ -10,6 +11,7 @@ import {
   assertTablesAllowed,
   assertColumnsAllowed,
 } from "../sql-safety/allowlist.js";
+import { auditLog } from "../audit/audit.js";
 
 const QueryArgsSchema = z.object({
   sql: z
@@ -22,7 +24,7 @@ const QueryArgsSchema = z.object({
     .describe("Optional positional parameters for the query."),
 });
 
-function blocked(reason: string) {
+function blocked(reason: string): CallToolResult {
   return {
     content: [{ type: "text" as const, text: `Blocked: ${reason}` }],
     isError: true,
@@ -40,18 +42,43 @@ export function registerQueryTool(server: McpServer): void {
       inputSchema: QueryArgsSchema,
     },
     async ({ sql, params = [] }, extra) => {
+      const callerId = extra.authInfo?.clientId ?? "stdio";
+      const started = performance.now();
+
+      const finish = (
+        status: "success" | "blocked" | "error",
+        result: CallToolResult,
+        outcome: { row_count?: number; error?: string } = {},
+      ): CallToolResult => {
+        auditLog(callerId, "query", sql, {
+          status,
+          duration_ms: performance.now() - started,
+          ...outcome,
+        });
+        return result;
+      };
+
       const parsed = parseStatements(sql);
-      if (!parsed.ok) return blocked(parsed.reason);
+      if (!parsed.ok)
+        return finish("blocked", blocked(parsed.reason), {
+          error: parsed.reason,
+        });
 
       const readOnly = assertReadOnlyStatements(parsed.statements);
-      if (!readOnly.ok) return blocked(readOnly.reason);
+      if (!readOnly.ok)
+        return finish("blocked", blocked(readOnly.reason), {
+          error: readOnly.reason,
+        });
 
       if (config.allowedTables) {
         const tables = assertTablesAllowed(
           parsed.statements,
           config.allowedTables,
         );
-        if (!tables.ok) return blocked(tables.reason);
+        if (!tables.ok)
+          return finish("blocked", blocked(tables.reason), {
+            error: tables.reason,
+          });
       }
 
       if (config.allowedColumns) {
@@ -59,31 +86,42 @@ export function registerQueryTool(server: McpServer): void {
           parsed.statements,
           config.allowedColumns,
         );
-        if (!columns.ok) return blocked(columns.reason);
+        if (!columns.ok)
+          return finish("blocked", blocked(columns.reason), {
+            error: columns.reason,
+          });
       }
 
       const client = await pool.connect();
       try {
         await client.query("BEGIN TRANSACTION READ ONLY");
         const result = await client.query(sql, params);
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(
-                { rowCount: result.rowCount, rows: result.rows },
-                null,
-                2,
-              ),
-            },
-          ],
-        };
+        return finish(
+          "success",
+          {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  { rowCount: result.rowCount, rows: result.rows },
+                  null,
+                  2,
+                ),
+              },
+            ],
+          },
+          { row_count: result.rowCount ?? 0 },
+        );
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        return {
-          content: [{ type: "text", text: `Query failed: ${message}` }],
-          isError: true,
-        };
+        return finish(
+          "error",
+          {
+            content: [{ type: "text", text: `Query failed: ${message}` }],
+            isError: true,
+          },
+          { error: message },
+        );
       } finally {
         try {
           await client.query("ROLLBACK");

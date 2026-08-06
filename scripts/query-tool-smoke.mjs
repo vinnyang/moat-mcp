@@ -1,5 +1,6 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { Writable } from "node:stream";
 
 const DATABASE_URL =
   process.env.DATABASE_URL ??
@@ -11,10 +12,27 @@ const watchdog = setTimeout(() => {
 }, 30_000);
 watchdog.unref();
 
+// Capture the server's stderr (the audit stream) line-by-line.
+const auditLines = [];
+let stderrBuffer = "";
+const stderrSink = new Writable({
+  write(chunk, _enc, cb) {
+    stderrBuffer += chunk.toString();
+    let newline;
+    while ((newline = stderrBuffer.indexOf("\n")) >= 0) {
+      const line = stderrBuffer.slice(0, newline).trim();
+      stderrBuffer = stderrBuffer.slice(newline + 1);
+      if (line) auditLines.push(line);
+    }
+    cb();
+  },
+});
+
 const transport = new StdioClientTransport({
   command: "node",
   args: ["dist/index.js"],
   env: { ...process.env, DATABASE_URL },
+  stderr: stderrSink,
 });
 const client = new Client(
   { name: "query-tool-smoke", version: "1.0.0" },
@@ -95,6 +113,54 @@ if (del.isError && del.text.includes("Blocked")) {
 } else {
   fail("write was NOT blocked: " + del.text.slice(0, 150));
 }
+
+// Audit gate: every query — success AND blocked — must emit exactly one
+// append-only JSON line on stderr with correct status + row_count.
+await new Promise((r) => setTimeout(r, 100));
+const audits = auditLines.map((line) => {
+  try {
+    return JSON.parse(line);
+  } catch {
+    return null;
+  }
+}).filter((a) => a !== null && a.sql_text !== undefined);
+
+if (audits.length !== 3) {
+  fail(`expected 3 audit rows (2 success + 1 blocked), got ${audits.length}`);
+} else {
+  ok("audit: exactly 3 records appended (2 success + 1 blocked)");
+}
+
+const rowId = (r) => Number(r?.id); // records are appended in order
+const expected = audits
+  .slice()
+  .sort((a, b) => rowId(a) - rowId(b))
+  .map((a) => ({ status: a.status, row_count: a.row_count ?? null }));
+
+if (
+  expected[0]?.status === "success" &&
+  expected[0]?.row_count === 5 &&
+  expected[1]?.status === "success" &&
+  expected[1]?.row_count === 1 &&
+  expected[2]?.status === "blocked" &&
+  expected[2]?.row_count === null
+) {
+  ok("audit rows carry correct status + row_count (success:5, success:1, blocked)");
+} else {
+  fail("audit rows/status mismatch: " + JSON.stringify(expected));
+}
+
+const wellFormed = audits.every(
+  (a) =>
+    a.tool === "query" &&
+    a.caller_id === "stdio" &&
+    typeof a.ts === "string" &&
+    typeof a.duration_ms === "number" &&
+    (a.status === "blocked" || a.status === "error" ? typeof a.error === "string" : a.error === undefined),
+);
+if (wellFormed) ok("audit rows are well-formed (tool, caller_id, ts, duration_ms, status/error contract)");
+else fail("audit rows missing required fields: " + JSON.stringify(audits));
+
 await transport.close();
 console.log(failures === 0 ? "\nALL CHECKS PASSED" : `\n${failures} CHECK(S) FAILED`);
 process.exit(failures === 0 ? 0 : 1);
