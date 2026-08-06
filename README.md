@@ -23,6 +23,16 @@ pg connection pool ──► Postgres (moat_mcp DB, mcp_readonly role)
 
 ## Quick start
 
+**One command boots the whole stack** — Postgres (schema + data + read-only role + RLS) and the server over HTTP with OAuth:
+
+```bash
+docker compose up --build
+```
+
+Then connect any MCP client that supports OAuth to `http://localhost:3333/mcp` (the server exposes its OAuth 2.1 authorization server at `/.well-known/oauth-authorization-server`).
+
+For local dev without Docker:
+
 ```bash
 # 1. Start Postgres with schema + data + read-only role (first boot only)
 docker compose up -d postgres
@@ -153,6 +163,83 @@ node dist/index.js 2>>audit.log      # append JSON lines to a file
 node dist/index.js --http 2> >(tee -a audit.log)   # or tee to a collector
 ```
 
+## Threat model & defense
+
+`moat-mcp` is a remote-capable SQL server: an attacker who can reach it can send arbitrary SQL text. The threat model below walks STRIDE and maps each threat to the layer that defeats it and the test that proves it. Every defense is enforced server-side — tool annotations like `readOnlyHint` are hints to the client, not controls.
+
+### 5-layer defense in depth
+
+```
+AI client (untrusted)
+   │  sql text + params
+   ▼
+┌──────────────────────────────────────────────────────────────┐
+│ L1  OAuth 2.1 / JWT          who is calling? 401/403 on wire │
+│ L2  SQL-AST gate             parse + reject writes/functions │
+│ L3  Allow-lists              which tables/columns may be read│
+│ L4  Row-Level Security       Postgres filters rows per caller│
+│ L5  BEGIN ... READ ONLY      DB refuses writes (backstop)    │
+└──────────────────────────────────────────────────────────────┘
+   │
+   ▼
+   Postgres (mcp_readonly role)
+```
+
+Any single layer failing still leaves the others — that is the point of defense in depth.
+
+### STRIDE
+
+| Threat | Scenario | Defense | Test |
+|---|---|---|---|
+| **S**poofing | Attacker pretends to be another client | OAuth 2.1 + JWT (`aud`/`iss`/`exp`/signature) on every HTTP request | `test/auth.test.ts` |
+| **T**ampering | `SELECT 1; DROP TABLE film;` — stacked statements mutate data | L2 AST gate rejects non-read-only statements | `test/redteam.test.ts` |
+| **R**epudiation | "I never ran that query" | Append-only audit log with `caller_id` + `ts` + monotonic `id` | `test/audit.test.ts` |
+| **I**nformation disclosure | `SELECT * FROM secrets` or `SELECT rating FROM film` beyond allow-list | L3 table/column allow-lists (deny by default) | `test/redteam.test.ts`, `test/allowlist.test.ts` |
+| **I**nformation disclosure (row) | Caller reads another tenant's rows | L4 RLS: Postgres filters rows via `app.caller` | `test:smoke` (count = 194/1000) |
+| **D**enial of service | `SELECT pg_sleep(10)` pins a connection | L2 function blocklist (`pg_sleep`, `dblink`, `pg_read_file`…) | `test/redteam.test.ts` |
+| **D**enial of service | `SET statement_timeout = 0` disables the timeout GUC | L2 rejects `SET` (not read-only) | `test/redteam.test.ts` |
+| **E**levation of privilege | `SET row_security = off` tries to disable RLS | L2 rejects `SET`; RLS enforced by DB role, not the app | `test/redteam.test.ts` |
+| **E**levation of privilege | `COPY ... TO PROGRAM` attempts OS command execution | L2 rejects `COPY`; also blocked by read-only role + TX | `test/redteam.test.ts` |
+
+### vs. reference implementations
+
+| Capability | moat-mcp | official `server-postgres` | Crystal (`server-crystal`) | AWS `bedrock-agents-sql` |
+|---|---|---|---|---|
+| Read-only enforcement | AST gate + read-only TX | read-only TX only | read-only TX only | read-only TX only |
+| Multi-statement injection | blocked (AST) | **vulnerable** (multi-statement not gated) | limited | limited |
+| Table/column allow-list | yes (config) | no | no | no |
+| Row-Level Security | yes (`app.caller`) | no | no | no |
+| OAuth 2.1 + JWT | yes | SDK-level | SDK-level | SDK-level |
+| Audit log | append-only, who/what/when | no | no | no |
+| Deny-by-default parse | yes | no | no | no |
+
+The headline difference: moat-mcp gates **stacked queries at the AST level** — the gap that lets `SELECT 1; DROP TABLE film;` slip past a read-only transaction in the official server.
+
+### Blocked attacks (red-team suite)
+
+`test/redteam.test.ts` proves each attack is stopped before it reaches Postgres. Run it with `npm run test:redteam`.
+
+| Attack | Result |
+|---|---|
+| `SELECT 1; DROP TABLE film;` | **blocked** — stacked statements rejected at the AST |
+| `SELECT title FROM film; UPDATE film SET title='x'` | **blocked** |
+| `SET row_security = off` | **blocked** — RLS bypass attempt |
+| `SET statement_timeout = 0` | **blocked** — DoS GUC |
+| `SELECT pg_sleep(10)` | **blocked** — function blocklist |
+| `COPY (...) TO PROGRAM 'rm -rf /'` | **blocked** — RCE vector |
+| `SELECT * FROM secrets` (not allow-listed) | **blocked** — allow-list |
+| `SELECT rating FROM film` (column not allowed) | **blocked** — allow-list |
+| `THIS IS NOT SQL` (unparseable) | **blocked** — deny by default |
+
+Actual run:
+
+```
+npx vitest run test/redteam.test.ts
+
+ Test Files  1 passed (1)
+      Tests  11 passed (11)
+```
+
 ## Development
 
 | Command | Purpose |
@@ -164,7 +251,8 @@ node dist/index.js --http 2> >(tee -a audit.log)   # or tee to a collector
 | `node dist/index.js --http` | Run over HTTP with OAuth 2.1 (`MCP_TRANSPORT=http` also works) |
 | `npm run test:smoke` | Build + run the end-to-end MCP stdio smoke test |
 | `npm run test:smoke:oauth` | Build + run the full OAuth 2.1 + JWT smoke test over HTTP |
-| `npm test` | Unit tests (vitest) — SQL safety gates + auth/JWT, no DB required |
+| `npm test` | Unit tests (vitest) — SQL safety gates + auth/JWT + audit, no DB required |
+| `npm run test:redteam` | Red-team suite (vitest) — every documented attack is **blocked** |
 
 > `tsx` is a dev-only convenience and depends on platform-native esbuild. The committed path — `npm run build` → `node dist/index.js` — has no native dependencies and runs anywhere.
 
@@ -200,7 +288,7 @@ If the database is unreachable, the smoke test fails with a clean message (`conn
 2. dynamic client registration returns a `client_id`
 3. PKCE authorization redirect returns a `code` + matching `state`
 4. code + verifier exchange yields a JWT access token and refresh token
-5. authenticated `initialize` / `tools/list` / `tools/call query` succeed over streamable HTTP (M1–M5 stack together)
+5. authenticated `initialize` / `tools/list` / `tools/call query` succeed over streamable HTTP
 6. refresh token exchange rotates the token
 7. missing or invalid `Authorization` is rejected with `401`
 
@@ -211,6 +299,8 @@ If the database is unreachable, the smoke test fails with a clean message (`conn
 `test/auth.test.ts` unit-tests the JWT + OAuth provider (8 cases): token round-trip; wrong issuer/audience/expiry/secret all rejected; the full authorize→code→token→refresh flow with single-use rotation; a code issued to a different client rejected; an unregistered `redirect_uri` rejected.
 
 `test/audit.test.ts` unit-tests the append-only audit logger (5 cases): records get auto-assigned `id` + `ts`; ids are strictly increasing; optional `error` present for blocked/error only; `row_count` absent for blocked; `resetAuditSink` restores stderr. No DB or transport needed.
+
+`test/redteam.test.ts` is the red-team suite (11 cases, no DB needed): every attack in the threat-model table above must come back **blocked** — stacked statements, security-GUC bypasses (`SET row_security`, `SET statement_timeout`), `pg_sleep`/`dblink` function blocklist, `COPY ... TO PROGRAM` RCE, allow-list escapes, and deny-by-default on unparseable input.
 
 ```bash
 npm test          # unit tests (no DB required)
@@ -226,7 +316,7 @@ Exit code `0` on success, `1` on failure. `DATABASE_URL` is read from the enviro
 
 1. Starts a `postgres:16` service container, mounting `sql/` as init scripts
 2. Health-gate waits until `film` has 1000 rows (never races the data load)
-3. `npm ci` → `npm run typecheck` → `npm test` → `npm run test:smoke` → `npm run test:smoke:oauth`
+3. `npm ci` → `npm run typecheck` → `npm test` → `npm run test:redteam` → `npm run test:smoke` → `npm run test:smoke:oauth`
 
 ## Project structure
 
@@ -237,7 +327,7 @@ src/
   db/pool.ts        # pg connection pool
   tools/query.ts    # the `query` tool (registerTool + handler; 3 gates: readonly, tables, columns)
   sql-safety/
-    readonly.ts     # read-only gate (parses + classifies statements)
+    readonly.ts     # read-only gate (parses + classifies statements + function blocklist)
     allowlist.ts    # table/column allow-list gates (AST walk + alias/CTE resolution)
   auth/
     jwt.ts          # JWT issue + verify (HS256, iss/aud/exp), PKCE + random-token helpers
@@ -247,7 +337,7 @@ src/
   audit/audit.ts    # append-only query audit logger (success/blocked/error → stderr JSON)
 sql/                # Postgres bootstrap (schema, data, read-only role, RLS policies)
 scripts/            # QA / smoke test harnesses
-test/               # unit tests (vitest: readonly, allowlists, auth)
+test/               # unit tests (vitest: readonly, allowlists, auth, audit, redteam)
 .github/workflows/  # CI
 ```
 

@@ -54,6 +54,9 @@ jobs:
       - name: Unit tests
         run: npm test
 
+      - name: Red-team suite (attacks must be blocked)
+        run: npm run test:redteam
+
       - name: Smoke test (build + MCP stdio query tool)
         run: npm run test:smoke
         env:
