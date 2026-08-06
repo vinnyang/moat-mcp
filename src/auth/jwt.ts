@@ -52,6 +52,8 @@ export async function verifyAccessToken(token: string): Promise<AuthInfo> {
   let payload: JWTPayload;
   try {
     ({ payload } = await jwtVerify(token, signingKey, {
+      // Pinned so a token cannot select its own verification algorithm.
+      algorithms: ["HS256"],
       issuer: config.jwtIssuer,
       audience: config.jwtAudience,
     }));

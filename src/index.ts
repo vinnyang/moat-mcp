@@ -1,4 +1,6 @@
-import { config } from "./config.js";
+import { config, assertSecureConfig } from "./config.js";
+
+assertSecureConfig();
 
 if (config.transport === "http") {
   const { startHttpServer } = await import("./http.js");

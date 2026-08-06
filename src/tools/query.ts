@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { z } from "zod/v4";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
@@ -58,6 +59,11 @@ export function registerQueryTool(server: McpServer): void {
         return result;
       };
 
+      if (sql.length > config.maxSqlLength) {
+        const reason = `SQL is ${sql.length} characters, over the ${config.maxSqlLength} limit`;
+        return finish("blocked", blocked(reason), { error: reason });
+      }
+
       const parsed = parseStatements(sql);
       if (!parsed.ok)
         return finish("blocked", blocked(parsed.reason), {
@@ -74,6 +80,7 @@ export function registerQueryTool(server: McpServer): void {
         const tables = assertTablesAllowed(
           parsed.statements,
           config.allowedTables,
+          config.defaultSchema,
         );
         if (!tables.ok)
           return finish("blocked", blocked(tables.reason), {
@@ -96,6 +103,14 @@ export function registerQueryTool(server: McpServer): void {
       try {
         await client.query("BEGIN TRANSACTION READ ONLY");
         const result = await client.query(sql, params);
+        const rowCount = result.rowCount ?? 0;
+        if (rowCount > config.maxRows) {
+          const reason = `result of ${rowCount} rows exceeds the ${config.maxRows}-row cap; add a LIMIT or narrow the query`;
+          return finish("blocked", blocked(reason), {
+            row_count: rowCount,
+            error: reason,
+          });
+        }
         return finish(
           "success",
           {
@@ -114,13 +129,22 @@ export function registerQueryTool(server: McpServer): void {
         );
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
+        // The driver's message names columns, types and server internals, which
+        // turns a failed query into a schema-enumeration oracle. The caller gets
+        // a correlation id; the detail goes to the audit trail only.
+        const ref = randomUUID();
         return finish(
           "error",
           {
-            content: [{ type: "text", text: `Query failed: ${message}` }],
+            content: [
+              {
+                type: "text",
+                text: `Query failed (ref: ${ref}). The reason was recorded in the audit log.`,
+              },
+            ],
             isError: true,
           },
-          { error: message },
+          { error: `[${ref}] ${message}` },
         );
       } finally {
         try {
