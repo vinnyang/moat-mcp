@@ -22,3 +22,5 @@ coverage/
 .DS_Store
 .idea/
 .vscode/
+# Local planning notes (contains personal/career content — not for publication)
+IMPROVEMENT-PLAN.md
