@@ -54,16 +54,55 @@ function collectTableRefs(
   return tables;
 }
 
+/**
+ * Normalizes a relation to `schema.table`.
+ *
+ * Matching on the bare table name lets `other_schema.film` satisfy an allow-list
+ * entry of `film`, so both the reference and the configured entry are qualified
+ * with the default schema before comparison.
+ */
+function qualify(schema: string | null, table: string, defaultSchema: string): string {
+  return `${(schema ?? defaultSchema).toLowerCase()}.${table.toLowerCase()}`;
+}
+
+/** Qualified `schema.table` names referenced by the statement. */
+function collectQualifiedTableRefs(
+  statement: unknown,
+  exclude: ReadonlySet<string>,
+  defaultSchema: string,
+): Map<string, string> {
+  const refs = new Map<string, string>();
+  walk(statement, (node) => {
+    if (node.type === "column_ref") return;
+    if (typeof node.table !== "string" || exclude.has(node.table)) return;
+    const schema = typeof node.db === "string" && node.db ? node.db : null;
+    const display = schema ? `${schema}.${node.table}` : node.table;
+    refs.set(qualify(schema, node.table, defaultSchema), display);
+  });
+  return refs;
+}
+
 export function assertTablesAllowed(
   statements: unknown[],
   allowedTables: ReadonlySet<string>,
+  defaultSchema = "public",
 ): AllowListVerification {
+  const allowed = new Set<string>();
+  for (const entry of allowedTables) {
+    const dot = entry.indexOf(".");
+    allowed.add(
+      dot > 0
+        ? qualify(entry.slice(0, dot), entry.slice(dot + 1), defaultSchema)
+        : qualify(null, entry, defaultSchema),
+    );
+  }
+
   const disallowed = new Set<string>();
   for (const statement of statements) {
     const ctes = collectCteNames(statement);
-    const tables = collectTableRefs(statement, ctes);
-    for (const table of tables) {
-      if (!allowedTables.has(table)) disallowed.add(table);
+    const tables = collectQualifiedTableRefs(statement, ctes, defaultSchema);
+    for (const [qualified, display] of tables) {
+      if (!allowed.has(qualified)) disallowed.add(display);
     }
   }
   if (disallowed.size > 0) {
@@ -118,8 +157,10 @@ function checkColumnRef(
 
   if (skip) return null;
 
-  const allowed = allowedColumns.get(realTable!);
-  if (!allowed || !allowed.has(ref.column)) {
+  // Compared lower-cased to match PostgreSQL's folding of unquoted identifiers,
+  // so `FROM FILM` and `FROM film` resolve to the same allow-list entry.
+  const allowed = allowedColumns.get(realTable!.toLowerCase());
+  if (!allowed || !allowed.has(ref.column.toLowerCase())) {
     return `column '${realTable}.${ref.column}' is not allowed`;
   }
   return null;
@@ -192,8 +233,16 @@ function findColumnViolation(
 
 export function assertColumnsAllowed(
   statements: unknown[],
-  allowedColumns: ReadonlyMap<string, ReadonlySet<string>>,
+  configuredColumns: ReadonlyMap<string, ReadonlySet<string>>,
 ): AllowListVerification {
+  const allowedColumns = new Map<string, ReadonlySet<string>>();
+  for (const [table, columns] of configuredColumns) {
+    allowedColumns.set(
+      table.toLowerCase(),
+      new Set([...columns].map((column) => column.toLowerCase())),
+    );
+  }
+
   for (const statement of statements) {
     const cteNames = collectCteNames(statement);
     const allTables = collectTableRefs(statement, cteNames);
