@@ -1,5 +1,5 @@
 /**
- * Query audit logging (M6).
+ * Query audit logging.
  *
  * Every `query` tool call — success, blocked, or error — appends exactly one
  * JSON record to an append-only audit stream. Append-only is enforced by the

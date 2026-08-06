@@ -191,7 +191,7 @@ try {
   if (parsed.rowCount !== 1 || !parsed.rows?.length) {
     throw new Error("query tool did not return a row: " + text);
   }
-  ok("authenticated tools/call query returned 1 row across M1-M5 stack");
+  ok("authenticated tools/call query returned 1 row through the full stack");
 
   // 6. Refresh token rotation
   const refreshRes = await fetch(tokenEndpoint, {
