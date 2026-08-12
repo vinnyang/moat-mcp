@@ -42,7 +42,7 @@
   ],
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
-    "jose": "^5.0.0",
+    "jose": "^6.2.8",
     "node-sql-parser": "^5.0.0",
     "pg": "^8.23.0",
     "zod": "^4.4.3"
