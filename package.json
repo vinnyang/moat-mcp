@@ -45,7 +45,7 @@
     "jose": "^6.2.12",
     "node-sql-parser": "^5.0.0",
     "pg": "^8.23.0",
-    "zod": "^4.4.3"
+    "zod": "^4.5.4"
   },
   "devDependencies": {
     "@types/express": "^5.0.6",
